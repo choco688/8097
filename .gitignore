@@ -1,207 +1,990 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+cell1
+import pandas as pd
+import numpy as np
+import time
+import sklearn
+from packaging import version
 
-# C extensions
-*.so
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, KBinsDiscretizer, OneHotEncoder
+from sklearn.metrics import accuracy_score, recall_score, f1_score
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from pyTsetlinMachine.tm import MultiClassTsetlinMachine
+from IPython.display import display
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# === Load and Encode Data ===
+df = pd.read_csv("/home/choco/crop_rec.csv")
+le_y = LabelEncoder()
+df["label"] = le_y.fit_transform(df["label"])
+X, y = df.drop("label", axis=1), df["label"]
+X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# === Encoders (used ONLY for Tsetlin Machine) ===
+def thermometer_fit_transform(X_train, X_test, bins=10):
+    kb = KBinsDiscretizer(n_bins=bins, encode="ordinal", strategy="uniform")
+    Xt_tr = kb.fit_transform(X_train).astype(int)
+    Xt_te = kb.transform(X_test).astype(int)
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+    def to_thermo(X_ord):
+        # each ordinal value v -> [1]*v + [0]*(bins-v)
+        out = np.array(
+            [[1]*int(v) + [0]*(bins-int(v)) for row in X_ord for v in row]
+        ).reshape(len(X_ord), -1)
+        return out
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+    return to_thermo(Xt_tr).astype(np.uint8), to_thermo(Xt_te).astype(np.uint8)
 
-# Translations
-*.mo
-*.pot
+def gray_encode(n):
+    return n ^ (n >> 1)
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+def gray_fit_transform(X_train, X_test, bits=5):
+    max_bin = 2**bits - 1
+    kb = KBinsDiscretizer(n_bins=max_bin + 1, encode="ordinal", strategy="uniform")
+    Xt_tr = kb.fit_transform(X_train).astype(int)
+    Xt_te = kb.transform(X_test).astype(int)
 
-# Flask stuff:
-instance/
-.webassets-cache
+    def to_gray(X_ord):
+        encoded = []
+        for row in X_ord:
+            gray_row = []
+            for val in row:
+                g = gray_encode(int(val))
+                bits_vec = list(map(int, format(g, f"0{bits}b")))
+                gray_row.extend(bits_vec)
+            encoded.append(gray_row)
+        return np.array(encoded)
 
-# Scrapy stuff:
-.scrapy
+    return to_gray(Xt_tr).astype(np.uint8), to_gray(Xt_te).astype(np.uint8)
 
-# Sphinx documentation
-docs/_build/
+def onehot_fit_transform(X_train, X_test, bins=10):
+    # 1) Fit KBins on train only; transform both
+    kb = KBinsDiscretizer(n_bins=bins, encode="ordinal", strategy="uniform")
+    Xt_tr = kb.fit_transform(X_train).astype(int)
+    Xt_te = kb.transform(X_test).astype(int)
 
-# PyBuilder
-.pybuilder/
-target/
+    # 2) Force categories to be full 0..bins-1 for EACH feature to keep column count fixed
+    n_features = X_train.shape[1]
+    cats = [np.arange(bins) for _ in range(n_features)]
+    if version.parse(sklearn.__version__) >= version.parse("1.2"):
+        ohe = OneHotEncoder(categories=cats, sparse_output=False, handle_unknown="ignore")
+    else:
+        ohe = OneHotEncoder(categories=cats, sparse=False, handle_unknown="ignore")
 
-# Jupyter Notebook
-.ipynb_checkpoints
+    Xtr = ohe.fit_transform(Xt_tr)
+    Xte = ohe.transform(Xt_te)
+    return Xtr.astype(np.uint8), Xte.astype(np.uint8)
 
-# IPython
-profile_default/
-ipython_config.py
+tm_encoders = {
+    "Thermometer": lambda A, B: thermometer_fit_transform(A, B, bins=10),
+    "Gray Code":   lambda A, B: gray_fit_transform(A, B, bits=5),
+    "One-Hot":     lambda A, B: onehot_fit_transform(A, B, bins=10),
+}
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+# === Parameter Grids ===
+clause_grid = [50, 100, 200]
+T_grid = [10, 15, 20]
+s_grid = [3, 4, 5]
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+dt_depths = [5, 10, 15, None]
+rf_trees = [50, 100, 200]
+mlp_layers = [(50,), (100,), (100, 50)]
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+# === Training Loop ===
+results = []
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
+# ---------------- Baselines on RAW features (no encoding) ----------------
+Xtr_raw = X_train_raw.values
+Xte_raw = X_test_raw.values
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
+# Decision Tree (RAW)
+for depth in dt_depths:
+    model = DecisionTreeClassifier(max_depth=depth)
+    start = time.time()
+    model.fit(Xtr_raw, y_train)
+    end = time.time()
+    y_pred = model.predict(Xte_raw)
+    results.append({
+        "Encoding": "",                          # keep empty for non-TM
+        "Model": "Decision Tree",
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Recall": recall_score(y_test, y_pred, average="macro"),
+        "F1 Score": f1_score(y_test, y_pred, average="macro"),
+        "Time (s)": round(end - start, 2),
+        "Params": f"max_depth={depth}",
+        "Clauses": "-", "s": "-", "T": "-"
+    })
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+# Random Forest (RAW)
+for n in rf_trees:
+    model = RandomForestClassifier(n_estimators=n, random_state=42)
+    start = time.time()
+    model.fit(Xtr_raw, y_train)
+    end = time.time()
+    y_pred = model.predict(Xte_raw)
+    results.append({
+        "Encoding": "",
+        "Model": "Random Forest",
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Recall": recall_score(y_test, y_pred, average="macro"),
+        "F1 Score": f1_score(y_test, y_pred, average="macro"),
+        "Time (s)": round(end - start, 2),
+        "Params": f"n_estimators={n}",
+        "Clauses": "-", "s": "-", "T": "-"
+    })
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+# Neural Network (RAW)
+for layers in mlp_layers:
+    model = MLPClassifier(hidden_layer_sizes=layers, max_iter=1000, random_state=42)
+    start = time.time()
+    model.fit(Xtr_raw, y_train)
+    end = time.time()
+    y_pred = model.predict(Xte_raw)
+    results.append({
+        "Encoding": "",
+        "Model": "Neural Network",
+        "Accuracy": accuracy_score(y_test, y_pred),
+        "Recall": recall_score(y_test, y_pred, average="macro"),
+        "F1 Score": f1_score(y_test, y_pred, average="macro"),
+        "Time (s)": round(end - start, 2),
+        "Params": f"layers={layers}",
+        "Clauses": "-", "s": "-", "T": "-"
+    })
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+# ---------------- Tsetlin Machine on ENCODED features ----------------
+for enc_name, enc in tm_encoders.items():
+    try:
+        X_train_enc, X_test_enc = enc(X_train_raw.values, X_test_raw.values)
+        assert X_train_enc.shape[1] == X_test_enc.shape[1]
+    except Exception as e:
+        print(f"Encoding failed for {enc_name}: {e}")
+        continue
 
-# SageMath parsed files
-*.sage.py
+    for clauses in clause_grid:
+        for T in T_grid:
+            for s in s_grid:
+                model = MultiClassTsetlinMachine(clauses, T, s)
+                start = time.time()
+                model.fit(X_train_enc, y_train, epochs=100)
+                end = time.time()
+                y_pred = model.predict(X_test_enc)
+                results.append({
+                    "Encoding": enc_name,          # show encoding for TM only
+                    "Model": "Tsetlin Machine",
+                    "Accuracy": accuracy_score(y_test, y_pred),
+                    "Recall": recall_score(y_test, y_pred, average="macro"),
+                    "F1 Score": f1_score(y_test, y_pred, average="macro"),
+                    "Time (s)": round(end - start, 2),
+                    "Params": "-",
+                    "Clauses": clauses, "s": s, "T": T
+                })
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+# === Best Results Only ===
+df_results = pd.DataFrame(results)
+best_results = df_results.loc[
+    df_results.groupby(["Encoding", "Model"])["Accuracy"].idxmax()
+].reset_index(drop=True)
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# (Safety) Ensure non-TM rows keep Encoding empty
+best_results.loc[best_results["Model"] != "Tsetlin Machine", "Encoding"] = ""
 
-# Rope project settings
-.ropeproject
+# === Add interpretability rating ===
+def interpretability_rating(model_name: str) -> str:
+    if model_name == "Decision Tree":
+        return "High"
+    if model_name == "Tsetlin Machine":
+        return "High"
+    if model_name == "Random Forest":
+        return "Moderate"
+    if model_name == "Neural Network":
+        return "Low"
+    return "Unknown"
 
-# mkdocs documentation
-/site
+best_results["Interpretability"] = best_results["Model"].apply(interpretability_rating)
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+# === Final display (no 'Dim' column) ===
+final_results = best_results[[
+    "Encoding", "Model", "Accuracy", "F1 Score", "Recall",
+    "Params", "Clauses", "s", "T", "Time (s)", "Interpretability"
+]]
 
-# Pyre type checker
-.pyre/
+print("\n Best Results per Model + Encoding (Non-TM rows hide Encoding):")
+display(final_results)
 
-# pytype static type analyzer
-.pytype/
 
-# Cython debug symbols
-cython_debug/
+# === Cell 2 — Thermometer encoding: temperature-only AND voting for 'rice' (bins=10) ===
+# Encoder: thermometer for ALL features (bins=BINS).
+# Voting: use ALL positive clauses that contain ANY temperature literals.
+#         AND only on temperature bits; ALL satisfied temperature bins get +1.
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+import os, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from sklearn.preprocessing import LabelEncoder, KBinsDiscretizer
+from pyTsetlinMachine.tm import MultiClassTsetlinMachine as MCTM
 
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
+# ---------- prerequisites from Cell1 ----------
+assert 'X_train_raw' in globals() and 'X_test_raw' in globals()
+assert 'y_train' in globals() and 'y_test' in globals()
+assert 'best_results' in globals()
+assert 'thermometer_fit_transform' in globals()  
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+def _find_col(cols, cands):
+    for w in cands:
+        for c in cols:
+            if c.lower()==w.lower(): return c
+    for w in cands:
+        for c in cols:
+            if w.lower() in c.lower(): return c
+    return None
 
-# Ruff stuff:
-.ruff_cache/
+def thermo_bits_of_level(level:int, bins:int)->np.ndarray:
+    v = int(level)
+    return np.concatenate([np.ones(v, dtype=int), np.zeros(bins - v, dtype=int)])
 
-# PyPI configuration file
-.pypirc
+# ---------- thermometer settings ----------
+# 1) Thermometer-encode all features (fit on train, transform both)
+Xtr_th, Xte_th = thermometer_fit_transform(X_train_raw.values, X_test_raw.values, bins=BINS)
+n_feat_bits = Xtr_th.shape[1]
 
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
+# 2) Temperature column + model bin edges (aligned with same KBins as thermometer)
+FEAT_TEMP = _find_col(X_train_raw.columns, ["temperature","temp"])
+assert FEAT_TEMP is not None, "temperature column not found"
+kb_all = KBinsDiscretizer(n_bins=BINS, encode="ordinal", strategy="uniform")
+kb_all.fit(X_train_raw.values)
+temp_idx   = list(X_train_raw.columns).index(FEAT_TEMP)
+temp_edges = kb_all.bin_edges_[temp_idx]     # len = BINS + 1
+n_levels   = len(temp_edges) - 1             
+temp_bit_base = temp_idx * BINS
+temp_bit_idx  = np.arange(temp_bit_base, temp_bit_base + BINS, dtype=int)
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+# 3) Rice class id (consistent with RAW CSV)
+csv_path = "/home/choco/crop_rec.csv" if os.path.exists("/home/choco/crop_rec.csv") else "/mnt/data/crop_rec.csv"
+raw = pd.read_csv(csv_path)
+le_raw = LabelEncoder().fit(raw["label"].astype(str))
+rice_id = int(le_raw.transform(["rice"])[0])
+
+# 4) Choose TM params from best_results (Thermometer) or fallback / Gray best
+clauses, T_val, s_val = 200, 15, 3.0
+sub_tm_thermo = best_results[(best_results["Encoding"]=="Thermometer") & (best_results["Model"]=="Tsetlin Machine")]
+if not sub_tm_thermo.empty:
+    r = sub_tm_thermo.sort_values("Accuracy", ascending=False).iloc[0]
+    clauses = int(r["Clauses"]); T_val = int(r["T"]); s_val = float(r["s"])
+else:
+    sub_tm_gray = best_results[(best_results["Encoding"]=="Gray Code") & (best_results["Model"]=="Tsetlin Machine")]
+    if not sub_tm_gray.empty:
+        r = sub_tm_gray.sort_values("Accuracy", ascending=False).iloc[0]
+        clauses = int(r["Clauses"]); T_val = int(r["T"]); s_val = float(r["s"])
+
+# 5) Train TM on thermometer features
+tm = MCTM(clauses, T_val, s_val)
+tm.fit(Xtr_th, y_train.values, epochs=100)
+
+# 6) Rebuild literal actions via tm.ta_action(class, clause, ta) -> A[c, m, 2*n_feat_bits]
+classes = np.unique(y_train.values)
+n_classes = len(classes)
+A = np.zeros((n_classes, clauses, 2*n_feat_bits), dtype=np.int8)
+if not hasattr(tm, "ta_action") or not callable(tm.ta_action):
+    raise RuntimeError("tm.ta_action(class, clause, ta) is required but not available.")
+for c in range(n_classes):
+    for m in range(clauses):
+        for ta in range(2*n_feat_bits):
+            A[c, m, ta] = int(tm.ta_action(c, m, ta) != 0)
+print(f"[info] TA actions rebuilt (thermometer): shape={A.shape}")
+
+# 7) Positive-clause indices (fallback: even index = positive)
+base_sign = np.where(np.arange(clauses)%2==0, 1, -1).astype(int)
+rice_pos_idx = np.where(base_sign > 0)[0]
+
+# 8) EXACT AND on temperature thermometer bits; ALL satisfied bins +1
+pos_slice = slice(0, n_feat_bits)
+neg_slice = slice(n_feat_bits, 2*n_feat_bits)
+
+votes = np.zeros(n_levels, dtype=int)
+valid_clauses = 0  
+
+for m in rice_pos_idx:
+    pos_vec = A[rice_id, m, pos_slice]
+    neg_vec = A[rice_id, m, neg_slice]
+
+    # 仅温度位的要求：req[k] ∈ {-1,0,1}
+    req = np.full(BINS, -1, dtype=int)                 # -1: free; 0: must 0; 1: must 1
+    inc_pos = (pos_vec[temp_bit_idx] != 0)
+    inc_neg = (neg_vec[temp_bit_idx] != 0)
+    if np.any(inc_pos & inc_neg):                      
+        continue
+    req[inc_pos] = 1
+    req[inc_neg] = 0
+    if np.all(req == -1):                              
+        continue
+
+    valid_clauses += 1
+ 
+    for lvl in range(n_levels):
+        bits = thermo_bits_of_level(lvl, BINS)         
+        if np.all((req == -1) | (bits == req)):
+            votes[lvl] += 1
+
+print(f"[TM Thermometer] temperature-only AND voting: "
+      f"valid_clauses={valid_clauses}, total_votes={int(votes.sum())}")
+
+labels = [f"{float(temp_edges[i]):.2f}–{float(temp_edges[i+1]):.2f}" for i in range(n_levels)]
+plt.figure(figsize=(11, 5.2))
+plt.bar(np.arange(n_levels), votes.astype(int))
+plt.xticks(np.arange(n_levels), labels, rotation=45, ha="right")
+plt.xlabel(f"{FEAT_TEMP} (thermometer bins={BINS})")
+plt.ylabel("Vote count (temperature-only)")
+plt.title(
+    f"TM (Thermometer) — temperature-only voting for 'rice' (EXACT AND, all temp-involving positive clauses)\n"
+    f"clauses={clauses}, T={T_val}, s={s_val}, epochs=100; valid_clauses={valid_clauses}"
+)
+ax = plt.gca(); ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+plt.ylim(0, max(1, int(votes.max())))
+plt.tight_layout(); plt.show()
+
+
+
+# === Cell 3: Random Forest — temperature-only voting for class "rice" (tree-as-1-vote) ===
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+from sklearn.preprocessing import LabelEncoder, KBinsDiscretizer
+from sklearn.ensemble import RandomForestClassifier
+
+# -------------------- prerequisites --------------------
+assert 'X_train_raw' in globals() and 'X_test_raw' in globals(), "Run Cell 1 first."
+assert 'y_train' in globals() and 'y_test' in globals(), "Run Cell 1 first."
+assert 'best_results' in globals(), "Run Cell 1 first."
+
+# -------------------- config --------------------
+BITS                 = 5
+REQUIRE_BOTH_BOUNDS  = True
+MIN_TEMP_SPLITS      = 1
+MAX_WIDTH_FRAC       = 0.60
+DILATE               = 0
+
+# -------------------- locate 'temperature' and 'rice' --------------------
+def _find_col(cols, cands):
+    for w in cands:
+        for c in cols:
+            if c.lower() == w.lower():
+                return c
+    for w in cands:
+        for c in cols:
+            if w.lower() in c.lower():
+                return c
+    return None
+
+FEAT_TEMP = _find_col(X_train_raw.columns, ["temperature","temp"])
+assert FEAT_TEMP is not None, "temperature column not found"
+temp_idx = list(X_train_raw.columns).index(FEAT_TEMP)
+
+csv_path = "/home/choco/crop_rec.csv" if os.path.exists("/home/choco/crop_rec.csv") else "/mnt/data/crop_rec.csv"
+_raw = pd.read_csv(csv_path)
+rice_id = int(LabelEncoder().fit(_raw["label"].astype(str)).transform(["rice"])[0])
+
+# -------------------- pick RF params --------------------
+def _parse_rf_n(text):
+    try:
+        return int(str(text).split("=")[-1].strip())
+    except Exception:
+        return 100
+
+sub_rf = best_results[best_results["Model"]=="Random Forest"]
+n_estimators = 100
+if not sub_rf.empty:
+    n_estimators = _parse_rf_n(sub_rf.sort_values("Accuracy", ascending=False).iloc[0]["Params"])
+
+# -------------------- train RF --------------------
+rf = RandomForestClassifier(n_estimators=n_estimators, random_state=42, n_jobs=-1)
+rf.fit(X_train_raw.values, y_train.values)
+
+# -------------------- build REAL temperature bins --------------------
+kb = KBinsDiscretizer(n_bins=2**BITS, encode="ordinal", strategy="uniform").fit(X_train_raw.values)
+temp_edges   = kb.bin_edges_[temp_idx]
+n_levels     = len(temp_edges) - 1
+temp_centers = 0.5 * (temp_edges[:-1] + temp_edges[1:])
+temp_lo_all, temp_hi_all = float(temp_edges[0]), float(temp_edges[-1])
+
+# -------------------- voting --------------------
+votes = np.zeros(n_levels, dtype=int)
+trees_using_temp = 0
+intervals_count  = 0
+
+def vote_from_tree(estimator):
+    """Each tree: +1 for bins inside any rice-leaf temp interval"""
+    global votes, trees_using_temp, intervals_count
+
+    tree = estimator.tree_
+    children_left  = tree.children_left
+    children_right = tree.children_right
+    features       = tree.feature
+    thresholds     = tree.threshold
+    values         = tree.value
+
+    uses_temp = int(np.sum((features == temp_idx) & (thresholds > -1e10))) > 0
+    if not uses_temp:
+        return
+    trees_using_temp += 1
+
+    def leaf_pred(node_id):
+        counts = values[node_id, 0]
+        return int(np.argmax(counts))
+
+    def dfs(node, lo, hi, temp_splits):
+        global votes, intervals_count
+        # leaf?
+        if children_left[node] == -1 and children_right[node] == -1:
+            if leaf_pred(node) != rice_id:
+                return
+            has_lo, has_hi = np.isfinite(lo), np.isfinite(hi)
+            if REQUIRE_BOTH_BOUNDS and not (has_lo and has_hi):
+                return
+            if temp_splits < MIN_TEMP_SPLITS:
+                return
+            lo_eff = temp_lo_all if not has_lo else max(lo, temp_lo_all)
+            hi_eff = temp_hi_all if not has_hi else min(hi, temp_hi_all)
+            if hi_eff <= lo_eff:
+                return
+            if MAX_WIDTH_FRAC is not None and (hi_eff - lo_eff) / (temp_hi_all - temp_lo_all) > MAX_WIDTH_FRAC:
+                return
+            hit = np.where((temp_centers > lo_eff) & (temp_centers <= hi_eff))[0]
+            if hit.size == 0:
+                return
+            intervals_count += 1
+            for b in hit:
+                votes[b] += 1
+                if DILATE == 1:
+                    if b-1 >= 0:       votes[b-1] += 1
+                    if b+1 < n_levels: votes[b+1] += 1
+            return
+
+        f, thr = features[node], thresholds[node]
+        if f == temp_idx:
+            dfs(children_left[node], lo, min(hi, thr) if np.isfinite(hi) else thr, temp_splits+1)
+        else:
+            dfs(children_left[node], lo, hi, temp_splits)
+        if f == temp_idx:
+            dfs(children_right[node], max(lo, thr) if np.isfinite(lo) else thr, hi, temp_splits+1)
+        else:
+            dfs(children_right[node], lo, hi, temp_splits)
+
+    dfs(0, -np.inf, np.inf, 0)
+
+for est in rf.estimators_:
+    vote_from_tree(est)
+
+# -------------------- plot --------------------
+labels = [f"{float(temp_edges[i]):.2f}–{float(temp_edges[i+1]):.2f}" for i in range(n_levels)]
+plt.figure(figsize=(11, 5.2))
+plt.bar(np.arange(n_levels), votes, width=0.9)
+plt.xticks(np.arange(n_levels), labels, rotation=45, ha="right")
+plt.xlabel(f"{FEAT_TEMP} (raw thresholds; {2**BITS} bins)")
+plt.ylabel("RF votes for 'rice' (tree-as-1-vote)")
+plt.title(
+    f"Random Forest — temperature-only voting (class='rice')\n"
+    f"n_estimators={len(rf.estimators_)}, require_both_bounds={REQUIRE_BOTH_BOUNDS}, "
+    f"min_temp_splits={MIN_TEMP_SPLITS}, max_width_frac={MAX_WIDTH_FRAC}, dilate=±{DILATE}\n"
+    f"{trees_using_temp}/{len(rf.estimators_)} trees used temperature; intervals kept={intervals_count}"
+)
+ax = plt.gca()
+ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+plt.ylim(0, max(1, votes.max()))
+plt.tight_layout(); plt.show()
+
+
+
+
+
+# === Cell4: TM heatmap (Thermometer, 2D, bins match thresholds, voting version, auto axis) ===
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder, KBinsDiscretizer
+from pyTsetlinMachine.tm import MultiClassTsetlinMachine
+
+# ---------------- Preconditions ----------------
+assert 'X_train_raw' in globals() and 'X_test_raw' in globals(), "Run Cell 1 first."
+assert 'y_train' in globals() and 'y_test' in globals(), "Run Cell 1 first."
+assert 'best_results' in globals(), "Run Cell 1 first."
+assert 'thermometer_fit_transform' in globals(), "thermometer_fit_transform not defined."
+
+# ---------------- Config ----------------
+FEAT_PH, FEAT_HUM = "ph", "humidity"
+FIGSIZE, FIG_DPI = (7.5, 6), 160
+EDGE_DECIMALS, TICK_FONTSIZE = 2, 8
+
+# ---------------- Label id for 'rice' ----------------
+csv_paths = ["/home/choco/crop_rec.csv", "/mnt/data/crop_rec.csv"]
+_raw = next((pd.read_csv(p) for p in csv_paths if os.path.exists(p)), None)
+if _raw is None:
+    raise FileNotFoundError("Cannot load crop_rec.csv to recover label mapping.")
+le_tmp = LabelEncoder().fit(_raw["label"].astype(str))
+rice_id = int(le_tmp.transform(["rice"])[0])
+
+# ---------------- Encoding (Thermometer only) ----------------
+BINS_THERMO = 10  
+Xtr_tm, Xte_tm = thermometer_fit_transform(
+    X_train_raw.values, X_test_raw.values, bins=BINS_THERMO
+)
+
+# ---------------- Axes = booleanization thresholds ----------------
+n_bins_tm = BINS_THERMO
+kb_tm = KBinsDiscretizer(n_bins=n_bins_tm, encode="ordinal", strategy="uniform")
+kb_tm.fit(X_train_raw.values)
+ph_idx  = list(X_train_raw.columns).index(FEAT_PH)
+hum_idx = list(X_train_raw.columns).index(FEAT_HUM)
+ph_edges  = kb_tm.bin_edges_[ph_idx]
+hum_edges = kb_tm.bin_edges_[hum_idx]
+
+# ---------------- Empirical heatmap helper----------------
+ph_vals  = X_test_raw[FEAT_PH].astype(float).values
+hum_vals = X_test_raw[FEAT_HUM].astype(float).values
+
+def make_vote_heatmap(ph_vals, hum_vals, preds, x_edges, y_edges):
+    xb = pd.cut(ph_vals,  bins=x_edges, include_lowest=True)
+    yb = pd.cut(hum_vals, bins=y_edges, include_lowest=True)
+    dfb = pd.DataFrame({"xb": xb, "yb": yb, "pred": preds})
+    agg = (
+        dfb.groupby(["yb", "xb"], observed=False)
+           .agg(rice_ratio=("pred", "mean"), count=("pred", "size"))
+           .reset_index()
+    )
+    tbl = agg.pivot(index="yb", columns="xb", values="rice_ratio")
+    return tbl.fillna(0.0)
+
+def show_heat_with_edges(tbl, x_edges, y_edges, title):
+    plt.figure(figsize=FIGSIZE, dpi=FIG_DPI)
+    Z = tbl.values
+    X, Y = np.meshgrid(x_edges, y_edges)
+    pcm = plt.pcolormesh(X, Y, Z, cmap="Reds", vmin=0.0, vmax=1.0, shading="auto")
+
+    plt.title(title)
+    plt.xlabel(FEAT_PH); plt.ylabel(FEAT_HUM)
+
+    xt = np.linspace(x_edges[0], x_edges[-1], 10)
+    yt = np.linspace(y_edges[0], y_edges[-1], 10)
+    plt.xticks(xt, [f"{v:.{EDGE_DECIMALS}f}" for v in xt], rotation=45, ha="right", fontsize=TICK_FONTSIZE)
+    plt.yticks(yt, [f"{v:.{EDGE_DECIMALS}f}" for v in yt], fontsize=TICK_FONTSIZE)
+
+    cbar = plt.colorbar(pcm); cbar.set_label("Voting ratio (P[rice])")
+    plt.gcf().subplots_adjust(bottom=0.22, left=0.22)
+    plt.show()
+
+# ---------------- Train best TM and plot ----------------
+best_tm = best_results[best_results["Model"]=="Tsetlin Machine"].sort_values("Accuracy", ascending=False).iloc[0]
+tm = MultiClassTsetlinMachine(int(best_tm["Clauses"]), int(best_tm["T"]), float(best_tm["s"]))
+tm.fit(Xtr_tm, y_train.values, epochs=100)
+
+tm_preds = (tm.predict(Xte_tm) == rice_id).astype(int)  # 0/1 投票
+tm_heat_tbl = make_vote_heatmap(ph_vals, hum_vals, tm_preds, ph_edges, hum_edges)
+
+show_heat_with_edges(
+    tm_heat_tbl, ph_edges, hum_edges,
+    f"Tsetlin Machine (Thermometer, bins={BINS_THERMO}, voting ratio) — Rice suitability"
+)
+
+
+
+
+# === Cell5: TM heatmap (Thermometer, 2D, bins=10, voting ratio, 3 param sets) ===
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder, KBinsDiscretizer
+from pyTsetlinMachine.tm import MultiClassTsetlinMachine
+
+# ---------------- Preconditions ----------------
+assert 'X_train_raw' in globals() and 'X_test_raw' in globals(), "Run Cell 1 first."
+assert 'y_train' in globals() and 'y_test' in globals(), "Run Cell 1 first."
+assert 'best_results' in globals(), "Run Cell 1 first."
+assert 'thermometer_fit_transform' in globals(), "thermometer_fit_transform not defined."
+
+# ---------------- Config ----------------
+FEAT_PH, FEAT_HUM = "ph", "humidity"
+FIGSIZE, FIG_DPI = (7.5, 6), 160
+EDGE_DECIMALS, TICK_FONTSIZE = 2, 8
+BINS_THERMO = 10  
+
+# ---------------- Label id for 'rice' ----------------
+csv_paths = ["/home/choco/crop_rec.csv", "/mnt/data/crop_rec.csv"]
+_raw = next((pd.read_csv(p) for p in csv_paths if os.path.exists(p)), None)
+if _raw is None:
+    raise FileNotFoundError("Cannot load crop_rec.csv to recover label mapping.")
+le_tmp = LabelEncoder().fit(_raw["label"].astype(str))
+rice_id = int(le_tmp.transform(["rice"])[0])
+
+# ---------------- Encoding (Thermometer only) ----------------
+Xtr_tm, Xte_tm = thermometer_fit_transform(
+    X_train_raw.values, X_test_raw.values, bins=BINS_THERMO
+)
+
+# ---------------- Axes = booleanization thresholds ----------------
+kb_tm = KBinsDiscretizer(n_bins=BINS_THERMO, encode="ordinal", strategy="uniform")
+kb_tm.fit(X_train_raw.values)
+ph_idx  = list(X_train_raw.columns).index(FEAT_PH)
+hum_idx = list(X_train_raw.columns).index(FEAT_HUM)
+ph_edges  = kb_tm.bin_edges_[ph_idx]
+hum_edges = kb_tm.bin_edges_[hum_idx]
+
+# ---------------- Empirical heatmap helper  ----------------
+ph_vals  = X_test_raw[FEAT_PH].astype(float).values
+hum_vals = X_test_raw[FEAT_HUM].astype(float).values
+
+def make_vote_heatmap(ph_vals, hum_vals, preds, x_edges, y_edges):
+    xb = pd.cut(ph_vals,  bins=x_edges, include_lowest=True)
+    yb = pd.cut(hum_vals, bins=y_edges, include_lowest=True)
+    dfb = pd.DataFrame({"xb": xb, "yb": yb, "pred": preds})
+    agg = (
+        dfb.groupby(["yb", "xb"], observed=False)
+           .agg(rice_ratio=("pred", "mean"), count=("pred", "size"))
+           .reset_index()
+    )
+    tbl = agg.pivot(index="yb", columns="xb", values="rice_ratio")
+    return tbl.fillna(0.0)
+
+def show_heat_with_edges(tbl, x_edges, y_edges, title):
+    plt.figure(figsize=FIGSIZE, dpi=FIG_DPI)
+    Z = tbl.values
+    X, Y = np.meshgrid(x_edges, y_edges)
+    pcm = plt.pcolormesh(X, Y, Z, cmap="Reds", vmin=0.0, vmax=1.0, shading="auto")
+
+    plt.title(title)
+    plt.xlabel(FEAT_PH); plt.ylabel(FEAT_HUM)
+
+    xt = np.linspace(x_edges[0], x_edges[-1], 10)
+    yt = np.linspace(y_edges[0], y_edges[-1], 10)
+    plt.xticks(xt, [f"{v:.{EDGE_DECIMALS}f}" for v in xt],
+               rotation=45, ha="right", fontsize=TICK_FONTSIZE)
+    plt.yticks(yt, [f"{v:.{EDGE_DECIMALS}f}" for v in yt], fontsize=TICK_FONTSIZE)
+
+    cbar = plt.colorbar(pcm); cbar.set_label("Voting ratio (P[rice])")
+    plt.gcf().subplots_adjust(bottom=0.22, left=0.22)
+    plt.show()
+
+# ---------------- Train TM with THREE parameter sets and plot ----------------
+param_sets = [
+    (50,  10, 3.0),   # clauses, T, s
+    (100, 15, 4.0),
+    (200, 20, 5.0),
+]
+
+for clauses, T, s in param_sets:
+    tm = MultiClassTsetlinMachine(int(clauses), int(T), float(s))
+    tm.fit(Xtr_tm, y_train.values, epochs=100)
+
+    tm_preds = (tm.predict(Xte_tm) == rice_id).astype(int)
+
+    tm_heat_tbl = make_vote_heatmap(ph_vals, hum_vals, tm_preds, ph_edges, hum_edges)
+    show_heat_with_edges(
+        tm_heat_tbl, ph_edges, hum_edges,
+        f"Tsetlin Machine — Thermometer bins={BINS_THERMO}, clauses={clauses}, T={T}, s={s}, voting ratio"
+    )
+
+
+# === Cell 6: Heatmaps with REAL thresholds; large figure & max 10 ticks per axis ===
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder
+from sklearn.tree import DecisionTreeClassifier
+
+# ---------------------------- prerequisites from Cell 1 ----------------------------
+assert 'X_train_raw' in globals() and 'X_test_raw' in globals(), "Run cell1 first."
+assert 'y_train' in globals() and 'y_test' in globals(), "Run cell1 first."
+assert 'best_results' in globals(), "Run cell1 first to create best_results."
+
+# ---------------------------- config ----------------------------
+FEAT_PH, FEAT_HUM = "ph", "humidity"
+PH_MIN, PH_MAX = 4.0, 8.0
+HUM_MIN, HUM_MAX = 75.0, 85.0
+EPS = 1e-3         # fill for empty bins to avoid pure white
+FIGSIZE = (14, 10) # larger figure
+FIG_DPI = 200
+
+# ---------------------------- label id for 'rice' ----------------------------
+csv_paths = ["/home/choco/crop_rec.csv", "/mnt/data/crop_rec.csv"]
+_df_all = next((pd.read_csv(p) for p in csv_paths if os.path.exists(p)), None)
+if _df_all is None:
+    raise FileNotFoundError("Cannot load crop_rec.csv to recover label mapping.")
+rice_id = int(LabelEncoder().fit(_df_all["label"].astype(str)).transform(["rice"])[0])
+
+# ---------------------------- helpers ----------------------------
+def parse_dt_depth(text):
+    v = str(text).split("=")[-1].strip()
+    return None if v == "None" else int(v)
+
+def best_row(model_name, encoding=None):
+    df = best_results.copy()
+    if encoding is not None:
+        df = df[df["Encoding"] == encoding]
+    df = df[df["Model"] == model_name]
+    if df.empty:
+        raise ValueError(f"best_results has no row for: model={model_name}, encoding={encoding}")
+    return df.sort_values("Accuracy", ascending=False).iloc[0]
+
+def learned_edges_for_feature(tree, local_idx, vmin, vmax):
+    feats, thr = tree.feature, tree.threshold
+    cuts = sorted({float(t) for f, t in zip(feats, thr) if f == local_idx and t != -2.0})
+    edges = np.array(sorted(set([vmin] + [c for c in cuts if vmin < c < vmax] + [vmax])), dtype=float)
+    if edges.size < 2:
+        edges = np.array([vmin, vmax], dtype=float)
+    return edges
+
+def empirical_grid(x, y, scores, x_edges, y_edges):
+    xb = pd.cut(x, bins=x_edges, include_lowest=True, right=True)
+    yb = pd.cut(y, bins=y_edges, include_lowest=True, right=True)
+    tbl = (
+        pd.DataFrame({"xb": xb, "yb": yb, "s": scores})
+        .pivot_table(index="yb", columns="xb", values="s", aggfunc="mean", observed=False)
+    )
+    ny, nx = len(y_edges)-1, len(x_edges)-1
+    Z = np.full((ny, nx), np.nan, dtype=float)
+    xcats = tbl.columns.categories if hasattr(tbl.columns, "categories") else tbl.columns
+    ycats = tbl.index.categories   if hasattr(tbl.index, "categories")   else tbl.index
+    xi = {c:i for i,c in enumerate(xcats)}
+    yi = {r:i for i,r in enumerate(ycats)}
+    for r in tbl.index:
+        for c in tbl.columns:
+            Z[yi[r], xi[c]] = tbl.loc[r, c]
+    return np.where(np.isnan(Z), EPS, Z)
+
+def thin_ticks(edges, max_ticks=10):
+    """Return up to max_ticks thresholds evenly spread across edges."""
+    edges = np.asarray(edges, dtype=float)
+    if len(edges) <= max_ticks:
+        return edges
+    idx = np.linspace(0, len(edges)-1, max_ticks).round().astype(int)
+    idx[0] = 0; idx[-1] = len(edges)-1
+    return np.unique(edges[idx])
+
+def plot_heat_with_threshold_ticks(Z, x_edges, y_edges, title, fname):
+    fig, ax = plt.subplots(figsize=FIGSIZE, dpi=FIG_DPI)
+    mesh = ax.pcolormesh(x_edges, y_edges, Z, cmap="Reds",
+                         shading="flat", vmin=0.0+EPS, vmax=1.0)
+    cb = fig.colorbar(mesh, ax=ax); cb.set_label("P(rice) / Suitability", fontsize=12)
+    ax.set_xlabel("pH", fontsize=12); ax.set_ylabel("Humidity (%)", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.set_xlim(PH_MIN, PH_MAX); ax.set_ylim(HUM_MIN, HUM_MAX)
+
+    # ticks = REAL thresholds but at most 10 per axis
+    xt = thin_ticks(x_edges, max_ticks=10)
+    yt = thin_ticks(y_edges, max_ticks=10)
+    ax.set_xticks(xt); ax.set_xticklabels([f"{v:.2f}" for v in xt], rotation=35, ha="right")
+    ax.set_yticks(yt); ax.set_yticklabels([f"{v:.2f}" for v in yt])
+
+    ax.set_facecolor("#ffe5e5")
+    fig.tight_layout(); fig.savefig(fname, dpi=200, bbox_inches="tight"); plt.show()
+
+# ---------------------------- only use the two features ----------------------------
+Xtr2 = X_train_raw[[FEAT_PH, FEAT_HUM]].copy()
+Xte2 = X_test_raw[[FEAT_PH, FEAT_HUM]].copy()
+mask_range = (
+    (Xte2[FEAT_PH].values  >= PH_MIN) & (Xte2[FEAT_PH].values  <= PH_MAX) &
+    (Xte2[FEAT_HUM].values >= HUM_MIN) & (Xte2[FEAT_HUM].values <= HUM_MAX)
+)
+ph_te  = Xte2[FEAT_PH].values[mask_range]
+hum_te = Xte2[FEAT_HUM].values[mask_range]
+
+# ============================ Decision Tree (raw 2D) ============================
+try:
+    row_dt = best_row("Decision Tree", encoding="Gray Code")
+except Exception:
+    row_dt = best_row("Decision Tree", encoding=None)
+dt_max_depth = parse_dt_depth(row_dt["Params"])
+
+dt2 = DecisionTreeClassifier(max_depth=dt_max_depth, random_state=42)
+dt2.fit(Xtr2.values, y_train.values)
+dt_scores_in = dt2.predict_proba(Xte2.values)[:, rice_id][mask_range]
+
+ph_edges_dt  = learned_edges_for_feature(dt2.tree_, 0, PH_MIN, PH_MAX)
+hum_edges_dt = learned_edges_for_feature(dt2.tree_, 1, HUM_MIN, HUM_MAX)
+
+Z_dt = empirical_grid(ph_te, hum_te, dt_scores_in, ph_edges_dt, hum_edges_dt)
+plot_heat_with_threshold_ticks(
+    Z_dt, ph_edges_dt, hum_edges_dt,
+    "Decision Tree (raw 2D) — Axes = learned thresholds",
+    "heatmap_DT_2D_raw_thresholds.png"
+)
+
+print("Saved: heatmap_DT_2D_raw_thresholds.png")
+
+
+# ==== Cell7====
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def _extract_clauses_safe(tm, F):
+    K = getattr(tm, "number_of_clauses", None)
+    if K is None:
+        raise RuntimeError("TM 缺少 number_of_clauses 属性，请确认版本或用 CLAUSES 训练。")
+
+    if 'le_y' in globals():
+        C = len(le_y.classes_)
+    elif 'y_train' in globals():
+        C = int(pd.Series(y_train).nunique())
+    else:
+        raise RuntimeError("Cannot infer the number of categories: neither le_y nor y_train are available.")
+
+    by_class = {c: [] for c in range(C)}
+    for c in range(C):
+        for k in range(K):
+            pol = +1 if (k % 2 == 0) else -1 
+            pos_bits, neg_bits = [], []
+            for lit in range(2*F):
+                if tm.ta_action(c, k, lit) == 1:
+                    if lit < F: pos_bits.append(lit)
+                    else:       neg_bits.append(lit - F)
+            by_class[c].append({
+                "clause_id": k,
+                "polarity": pol,
+                "pos_bits": np.array(pos_bits, dtype=int),
+                "neg_bits": np.array(neg_bits, dtype=int)
+            })
+    return by_class, K, C
+
+# --------- thermometer  ----------
+def _bit_to_feature(bit_idx, bins):
+    return bit_idx // bins, bit_idx % bins
+
+def _interval_for_feature_in_clause(clause, feat_index, bins, edges):
+    """
+    thermometer semantics：
+      +: x ≥ edges[b+1]
+      -: ¬(x ≥ edges[b+1]) ≡ x < edges[b+1]
+    合并：
+      lower = max(All positive thresholds) (If none, then take edges[0]）
+      upper = min(All negative thresholds) (If none, then take edges[-1]）
+      lower < upper This is the effective range.
+    """
+    pos_thrs, neg_thrs = [], []
+    for bit in clause["pos_bits"]:
+        j, b = _bit_to_feature(bit, bins)
+        if j == feat_index: pos_thrs.append(edges[b+1])
+    for bit in clause["neg_bits"]:
+        j, b = _bit_to_feature(bit, bins)
+        if j == feat_index: neg_thrs.append(edges[b+1])
+    lower = max(pos_thrs) if pos_thrs else edges[0]
+    upper = min(neg_thrs) if neg_thrs else edges[-1]
+    has_any = bool(pos_thrs or neg_thrs)
+    return lower, upper, has_any
+
+def explain_feature_for_class(
+    class_name: str,
+    feature_name: str,
+    topn: int = 8,
+    show_plot: bool = True,
+    abs_importance: bool = False,   
+    freq_weight: bool = False,     
+    X_bin_for_weight=None           
+):
+    feature_list = X_train_raw.columns.to_list()
+    if feature_name not in feature_list:
+        raise ValueError(f"Cannot find the feature：{feature_name}；optional：{feature_list}")
+    feat_idx = feature_list.index(feature_name)
+
+    if 'le_y' in globals():
+        class_labels = le_y.classes_.tolist()
+        if class_name not in class_labels:
+            raise ValueError(f"Cannot find the feature：{class_name}；optional：{class_labels}")
+        cls_idx = class_labels.index(class_name)
+    else:
+        cls_idx = int(str(class_name).replace("class_", ""))
+
+    F = BINS * X_train_raw.shape[1]
+    by_class, K, C = _extract_clauses_safe(tm, F)
+    clauses = by_class[cls_idx]
+
+    edges = kbins.bin_edges_[feat_idx]  # 长度 BINS+1
+    rows = []
+    weights = {} 
+    if freq_weight:
+        if X_bin_for_weight is None:
+            raise ValueError("freq_weight=True send X_bin_for_weight（Xte_tm or Xtr_tm）。")
+    for cl in clauses:
+        lower, upper, has_feat = _interval_for_feature_in_clause(cl, feat_idx, BINS, edges)
+        if not has_feat: 
+            continue
+        rows.append({
+            "clause_id": cl["clause_id"],
+            "polarity": "+" if cl["polarity"]>0 else "-",
+            "lower": lower,
+            "upper": upper,
+            "valid_interval": lower < upper
+        })
+        if freq_weight:
+            fires = np.ones(X_bin_for_weight.shape[0], dtype=bool)
+            if len(cl["pos_bits"])>0:
+                fires &= X_bin_for_weight[:, cl["pos_bits"]].all(axis=1)
+            if len(cl["neg_bits"])>0:
+                fires &= (X_bin_for_weight[:, cl["neg_bits"]]==0).all(axis=1)
+            weights[cl["clause_id"]] = fires.sum()
+        else:
+            weights[cl["clause_id"]] = 1.0
+
+    df_clause_intervals = pd.DataFrame(rows).sort_values(
+        ["valid_interval","polarity","lower","upper"],
+        ascending=[False, False, True, True]
+    )
+    print(f"\n— Clause expression for feature '{feature_name}': lower ≤ x < upper:")
+    display(df_clause_intervals)
+
+    cuts = np.unique(edges)
+    seg_left, seg_right = cuts[:-1], cuts[1:]
+    seg_mid = (seg_left + seg_right)/2
+    votes = np.zeros_like(seg_mid, dtype=float)
+
+    for cl in clauses:
+        lower, upper, has_feat = _interval_for_feature_in_clause(cl, feat_idx, BINS, edges)
+        if not has_feat or lower >= upper:
+            continue
+        pol = 1.0 if abs_importance else (+1.0 if cl["polarity"]>0 else -1.0)
+        w = weights.get(cl["clause_id"], 1.0)
+        cover = (seg_mid >= lower) & (seg_mid < upper)
+        votes[cover] += pol * w
+
+    df_votes = pd.DataFrame({
+        "left": seg_left, "right": seg_right, "mid": seg_mid, "score": votes
+    })
+    df_votes["interval"] = df_votes.apply(lambda r: f"[{r.left:.6g}, {r.right:.6g})", axis=1)
+    df_votes_sorted = df_votes.sort_values("score", ascending=False)
+
+    title_mode = "abs-importance" if abs_importance else "net-votes"
+    title_weight = " (freq-weighted)" if freq_weight else ""
+    print(f"\n— Feature '{feature_name}' {title_mode}{title_weight} Top{topn} Range:")
+    display(df_votes_sorted.head(topn)[["interval","score"]])
+
+    if show_plot:
+        plt.figure(figsize=(10,4.2))
+        widths = df_votes["right"] - df_votes["left"]
+        colors = ["royalblue" if s>=0 else "tomato" for s in df_votes["score"]]
+        plt.bar(df_votes["mid"], df_votes["score"], width=widths, color=colors, edgecolor="black", alpha=0.9)
+        plt.axhline(0, ls="--", c="gray")
+        plt.title(f"{feature_name} → class [{class_name}] | {title_mode}{title_weight}")
+        plt.xlabel(feature_name)
+        plt.ylabel("Score (+ support / - suppress)")
+        for x, y in zip(df_votes["mid"], df_votes["score"]):
+            if abs(y) >= (0.05*max(abs(df_votes['score'].max()), 1.0)):
+                plt.text(x, y + (0.02*np.sign(y))*max(1.0, abs(df_votes['score'].max())),
+                         f"{int(y)}", ha="center", va="bottom" if y>0 else "top", fontsize=8)
+        plt.tight_layout()
+        plt.show()
+
+    return df_clause_intervals, df_votes
+
+# ===== Usage Example =====
+# 1) Check the "direction" (positive/negative net votes), and find the key interval for the "apple" category regarding "temperature" _ = explain_feature_for_class("apple", "temperature", topn=8, show_plot=True)
+
+# 2) Focus solely on "importance" (regardless of positive or negative, only consider the intensity of its occurrence) # _ = explain_feature_for_class("apple", "temperature", abs_importance=True)
+
+# 3) Weighted by "occurrence frequency of test set clauses" (closer to the impact during prediction)
+# Note: Pass Xte_tm in (the test set obtained from your previous thermometer encoding) # _ = explain_feature_for_class("apple", "temperature", freq_weight=True, X_bin_for_weight=Xte_tm)
+
